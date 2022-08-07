@@ -21,7 +21,16 @@ impl Constructors for MyConstructors {
     type Constant = Constant;
     type SumType = SumType;
     type Infinite = Infinite;
-    type Wildcard = &'static str;
+    type Wildcard = Wildcard;
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct Wildcard(&'static str);
+
+impl Default for Wildcard {
+    fn default() -> Self {
+        Wildcard("_")
+    }
 }
 
 impl SumtypeConstructor for SumType {
@@ -41,8 +50,11 @@ impl SumtypeConstructor for SumType {
     }
 }
 
-fn int(range: RangeInclusive<i128>) -> Pattern<MyConstructors> {
-    Pattern::new(Constructor::SignedInteger { bitsize: 64, range })
+fn int(range: RangeInclusive<i64>) -> Pattern<MyConstructors> {
+    Pattern::new(Constructor::SignedInteger {
+        bitsize: 64,
+        range: *range.start() as i128..=*range.end() as i128,
+    })
 }
 
 fn variant(
@@ -59,7 +71,7 @@ fn variant(
 }
 
 fn wildcard(wc: &'static str) -> Pattern<MyConstructors> {
-    Pattern::wildcard(wc)
+    Pattern::wildcard(Wildcard(wc))
 }
 
 fn just(inner: Pattern<MyConstructors>) -> Pattern<MyConstructors> {
@@ -92,6 +104,9 @@ fn direct_numbers() {
     println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, int(0..=1), IsReachable(true));
     assert_reach!(tree, int(0..=1), IsReachable(false));
+
+    let missing = tree.generate_missing_patterns();
+    assert!(!missing.is_empty());
 }
 
 #[test]
@@ -101,6 +116,7 @@ fn maybe_numbers() {
     assert_reach!(tree, just(int(0..=0)), IsReachable(false));
     assert_reach!(tree, none(), IsReachable(true));
     assert_reach!(tree, none(), IsReachable(false));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
@@ -110,6 +126,7 @@ fn maybe_overlapping_numbers() {
     assert_reach!(tree, just(int(2..=8)), IsReachable(true));
     assert_reach!(tree, just(int(1..=7)), IsReachable(false));
     assert_reach!(tree, none(), IsReachable(true));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
@@ -119,6 +136,7 @@ fn weirdness() {
     assert_reach!(tree, int(2..=7), IsReachable(true));
     assert_reach!(tree, int(1..=3), IsReachable(true));
     assert_reach!(tree, int(0..=9), IsReachable(true));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
@@ -127,6 +145,7 @@ fn sequential_numbers() {
     println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, tuple([int(2..=8), int(2..=3)]), IsReachable(true));
     assert_reach!(tree, tuple([int(1..=7), int(2..=3)]), IsReachable(false));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
@@ -136,6 +155,7 @@ fn strings() {
     assert_reach!(tree, string("that"), IsReachable(true));
     assert_reach!(tree, string("thisa"), IsReachable(true));
     assert_reach!(tree, string("this"), IsReachable(false));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
@@ -144,18 +164,21 @@ fn wildcard_no_params() {
     println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, wildcard("n"), IsReachable(true));
     assert_reach!(tree, int(9..=10), IsReachable(false));
+    assert!(dbg!(tree.is_exhaustive()) && dbg!(tree.generate_missing_patterns()).is_empty());
 }
 
 #[test]
 fn wildcard_can_be_unreachable() {
-    let mut tree = PatternTree::from_pattern(&int(i128::MIN..=i128::MAX));
+    let mut tree = PatternTree::from_pattern(&int(i64::MIN..=i64::MAX));
     println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, wildcard("n"), IsReachable(false));
+    assert!(tree.is_exhaustive() && dbg!(tree.generate_missing_patterns()).is_empty());
 
-    let mut tree = PatternTree::from_pattern(&just(int(i128::MIN..=i128::MAX)));
+    let mut tree = PatternTree::from_pattern(&just(int(i64::MIN..=i64::MAX)));
     println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, none(), IsReachable(true));
     assert_reach!(tree, wildcard("_"), IsReachable(false));
+    assert!(tree.is_exhaustive() && dbg!(tree.generate_missing_patterns()).is_empty());
 }
 
 #[test]
@@ -165,8 +188,10 @@ fn tuple_of_strings() {
     assert_reach!(tree, tuple([string("a"), string("a")]), IsReachable(false));
     assert_reach!(tree, tuple([string("a"), wildcard("_")]), IsReachable(true));
     assert_reach!(tree, tuple([string("a"), string("c")]), IsReachable(false));
+    assert!(!tree.generate_missing_patterns().is_empty());
     assert_reach!(tree, wildcard("_"), IsReachable(true));
     assert_reach!(tree, tuple([string("b"), string("b")]), IsReachable(false));
+    assert!(tree.is_exhaustive() && dbg!(tree.generate_missing_patterns()).is_empty());
 }
 
 #[test]
@@ -177,10 +202,22 @@ fn lots_of_ranges() {
     assert_reach!(tree, tuple([wildcard("_"), int(2..=2)]), IsReachable(true));
     assert_reach!(tree, tuple([int(2..=2), int(3..=3)]), IsReachable(true));
     assert_reach!(tree, tuple([int(2..=2), int(2..=3)]), IsReachable(false));
+    assert!(!tree.generate_missing_patterns().is_empty());
 }
 
 #[test]
 fn init_from_wc() {
     let mut tree = PatternTree::from_pattern(&wildcard("_"));
     assert_reach!(tree, tuple([int(0..=0), int(1..=1)]), IsReachable(false));
+    assert!(tree.generate_missing_patterns().is_empty());
+}
+
+#[test]
+fn min_max() {
+    use super::tree::merge::{signed_max, signed_min, unsigned_max};
+    assert_eq!(
+        signed_min(64)..=signed_max(64),
+        i64::MIN as i128..=i64::MAX as i128
+    );
+    assert_eq!(unsigned_max(32), u32::MAX as u128);
 }

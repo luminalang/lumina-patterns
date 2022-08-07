@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 
 pub(crate) type Params = usize;
 
-mod merge;
+pub(crate) mod merge;
 use merge::Merge;
 mod missing;
 
@@ -13,11 +13,11 @@ mod missing;
 pub enum PatternTree<C: Constructors> {
     SignedInteger {
         bitsize: u8,
-        branches: Vec<(RangeInclusive<i128>, PatternTree<C>)>,
+        branches: Vec<RangeBranch<C, i128>>,
     },
     UnsignedInteger {
         bitsize: u8,
-        branches: Vec<(RangeInclusive<u128>, PatternTree<C>)>,
+        branches: Vec<RangeBranch<C, u128>>,
     },
 
     Variant(C::SumType, Vec<VariantBranch<C>>),
@@ -29,10 +29,43 @@ pub enum PatternTree<C: Constructors> {
     None,
 }
 
-pub(crate) type VariantBranch<C> = (u64, PatternTree<C>);
-pub(crate) type ConstantBranch<C> = (Params, PatternTree<C>);
-pub(crate) type InfiniteBranch<C> = (<C as Constructors>::Infinite, PatternTree<C>);
-pub(crate) type RangeBranch<C, N> = (RangeInclusive<N>, PatternTree<C>);
+#[derive(Clone, Debug)]
+pub struct Branch<C: Constructors, A> {
+    pub(crate) con: PatternTree<C>,
+    pub(crate) data: A,
+}
+
+trait Branches<C: Constructors, A> {
+    fn get_matching(&mut self, a: &A) -> Option<&mut PatternTree<C>>;
+    fn on_continuation(
+        &mut self,
+        params: usize,
+        params_of: impl Fn(&A) -> usize,
+        f: &mut impl Fn(&mut PatternTree<C>),
+    );
+}
+
+impl<C: Constructors, A: PartialEq> Branches<C, A> for Vec<Branch<C, A>> {
+    fn get_matching(&mut self, a: &A) -> Option<&mut PatternTree<C>> {
+        self.iter_mut()
+            .find_map(|Branch { data, con }| if data == a { Some(con) } else { None })
+    }
+
+    fn on_continuation(
+        &mut self,
+        params: usize,
+        params_of: impl Fn(&A) -> usize,
+        f: &mut impl Fn(&mut PatternTree<C>),
+    ) {
+        self.iter_mut()
+            .for_each(|Branch { data, con }| con.on_continuation(params + params_of(data), f))
+    }
+}
+
+pub(crate) type VariantBranch<C> = Branch<C, u64>;
+pub(crate) type ConstantBranch<C> = Branch<C, Params>;
+pub(crate) type InfiniteBranch<C> = Branch<C, <C as Constructors>::Infinite>;
+pub(crate) type RangeBranch<C, N> = Branch<C, RangeInclusive<N>>;
 
 // for some constructors like infinite we hold on to the wildcard variants so we can re-merge
 // them into any additional variants we create afterwards.
@@ -118,28 +151,20 @@ impl<C: Constructors> PatternTree<C> {
             params -= 1;
 
             match self {
-                Variant(type_, branches) => branches
-                    .iter_mut()
-                    .for_each(|(tag, con)| con.on_continuation(params + type_.params_for(*tag), f)),
-                SignedInteger { branches, .. } => branches
-                    .iter_mut()
-                    .for_each(|(_, con)| con.on_continuation(params, f)),
-                UnsignedInteger { branches, .. } => branches
-                    .iter_mut()
-                    .for_each(|(_, con)| con.on_continuation(params, f)),
+                Variant(type_, branches) => {
+                    branches.on_continuation(params, |tag| type_.params_for(*tag), f)
+                }
+                SignedInteger { branches, .. } => branches.on_continuation(params, |_| 0, f),
+                UnsignedInteger { branches, .. } => branches.on_continuation(params, |_| 0, f),
                 Constant(_, wc, branches) => {
-                    branches
-                        .iter_mut()
-                        .for_each(|(p, con)| con.on_continuation(params + *p, f));
+                    branches.on_continuation(params, |p| *p, f);
 
                     if let Some(con) = &mut wc.con {
                         con.on_continuation(params, f);
                     }
                 }
                 Infinite(wc, branches) => {
-                    branches
-                        .iter_mut()
-                        .for_each(|(_, con)| con.on_continuation(params, f));
+                    branches.on_continuation(params, |_| 0, f);
 
                     if let Some(con) = &mut wc.con {
                         con.on_continuation(params, f);
@@ -203,27 +228,21 @@ impl<C: Constructors> PatternTree<C> {
 impl<C: Constructors> Constructor<C> {
     fn into_patterntree(self, params: usize, src: &mut FlatPatterns<C>) -> PatternTree<C> {
         match self {
-            Self::Variant { type_, tag } => {
-                PatternTree::Variant(type_, vec![(tag, src.drain_to_patterntree())])
-            }
-
+            Self::Variant { type_, tag } => PatternTree::Variant(type_, src.drain_to_branches(tag)),
             Self::SignedInteger { range, bitsize } => PatternTree::SignedInteger {
                 bitsize,
-                branches: vec![(range, src.drain_to_patterntree())],
+                branches: src.drain_to_branches(range),
             },
             Self::UnsignedInteger { range, bitsize } => PatternTree::UnsignedInteger {
                 bitsize,
-                branches: vec![(range, src.drain_to_patterntree())],
+                branches: src.drain_to_branches(range),
             },
-            Self::Constant(constr) => PatternTree::Constant(
-                constr,
-                WildcardKeeper::new(),
-                vec![(params, src.drain_to_patterntree())],
-            ),
-            Self::Infinite(constr) => PatternTree::Infinite(
-                WildcardKeeper::new(),
-                vec![(constr, src.drain_to_patterntree())],
-            ),
+            Self::Constant(constr) => {
+                PatternTree::Constant(constr, WildcardKeeper::new(), src.drain_to_branches(params))
+            }
+            Self::Infinite(constr) => {
+                PatternTree::Infinite(WildcardKeeper::new(), src.drain_to_branches(constr))
+            }
             Self::Wildcard(wc) => PatternTree::UnknownWildcard(WildcardKeeper::init(wc, src)),
         }
     }
@@ -249,6 +268,13 @@ impl<C: Constructors> FlatPatterns<C> {
             None => PatternTree::None,
         }
     }
+
+    fn drain_to_branches<A>(&mut self, data: A) -> Vec<Branch<C, A>> {
+        vec![Branch {
+            data,
+            con: self.drain_to_patterntree(),
+        }]
+    }
 }
 
 impl<C: Constructors> PatternTree<C> {
@@ -260,42 +286,44 @@ impl<C: Constructors> PatternTree<C> {
     }
 }
 
+impl<C: Constructors, A: std::fmt::Debug> fmt::Display for Branch<C, A> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}{}", self.data, self.con.fmt_cont())
+    }
+}
+
+fn fmt_branches<C: Constructors, A: std::fmt::Debug>(
+    f: &mut fmt::Formatter,
+    branches: &[Branch<C, A>],
+) -> fmt::Result {
+    branches
+        .iter()
+        .try_for_each(|branch| writeln!(f, "{}", branch))
+}
+
+fn fmt_wildcard<C: Constructors>(f: &mut fmt::Formatter, wc: &WildcardKeeper<C>) -> fmt::Result {
+    wc.buf
+        .iter()
+        .try_for_each(|wc| writeln!(f, "{:?}:{:?}", wc.0, wc.1))
+}
+
 impl<C: Constructors> fmt::Display for PatternTree<C> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            PatternTree::SignedInteger { branches, .. } => branches
-                .iter()
-                .try_for_each(|(range, continuation)| writeln!(f, "{:?}{}", range, continuation)),
-            PatternTree::UnsignedInteger { branches, .. } => branches
-                .iter()
-                .try_for_each(|(range, continuation)| writeln!(f, "{:?}{}", range, continuation)),
+            PatternTree::SignedInteger { branches, .. } => fmt_branches(f, branches),
+            PatternTree::UnsignedInteger { branches, .. } => fmt_branches(f, branches),
             PatternTree::Variant(constr, branches) => {
-                branches.iter().try_for_each(|(tag, continuation)| {
-                    writeln!(f, "{:?}[{}]{}", constr, tag, continuation.fmt_cont())
+                branches.iter().try_for_each(|Branch { data: tag, con }| {
+                    writeln!(f, "{:?}[{}]{}", constr, tag, con.fmt_cont())
                 })
             }
-            PatternTree::Infinite(wildcard, branches) => branches
+            PatternTree::Infinite(wc, branches) => {
+                fmt_branches(f, branches).and_then(|_| fmt_wildcard(f, wc))
+            }
+            PatternTree::Constant(constr, wc, branches) => branches
                 .iter()
-                .try_for_each(|(constr, continuation)| {
-                    writeln!(f, "{:?}{}", constr, continuation.fmt_cont())
-                })
-                .and_then(|_| {
-                    wildcard
-                        .buf
-                        .iter()
-                        .try_for_each(|wc| writeln!(f, "{:?}:{:?}", wc.0, wc.1))
-                }),
-            PatternTree::Constant(constr, wildcard, branches) => branches
-                .iter()
-                .try_for_each(|(_, continuation)| {
-                    writeln!(f, "{:?}{}", constr, continuation.fmt_cont())
-                })
-                .and_then(|_| {
-                    wildcard
-                        .buf
-                        .iter()
-                        .try_for_each(|wc| writeln!(f, "{:?}:{:?}", wc.0, wc.1))
-                }),
+                .try_for_each(|Branch { con, .. }| writeln!(f, "{:?}{}", constr, con.fmt_cont()))
+                .and_then(|_| fmt_wildcard(f, wc)),
             PatternTree::UnknownWildcard(keeper) => writeln!(
                 f,
                 "{:?}{}",

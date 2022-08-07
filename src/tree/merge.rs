@@ -42,7 +42,7 @@ impl<'t, C: Constructors> Merge<'t, C> {
                     PatternTree::SignedInteger { branches, bitsize } => self
                         .src
                         .into_merger(branches)
-                        .with_wildcard_integer(wc, *bitsize as u32),
+                        .with_wildcard_signed_integer(wc, *bitsize as u32),
                     PatternTree::Variant(constr, branches) => self
                         .src
                         .into_merger(branches)
@@ -89,7 +89,10 @@ impl<'t, C: Constructors> Merge<'t, C> {
             Constructor::Variant { type_, .. } => PatternTree::Variant(type_, vec![]),
             Constructor::SignedInteger { bitsize, .. } => PatternTree::SignedInteger {
                 bitsize,
-                branches: vec![(min_max_from_bitsize(bitsize as u32), *keeper.con.unwrap())],
+                branches: vec![Branch {
+                    data: signed_min(bitsize as u32)..=signed_max(bitsize as u32),
+                    con: *keeper.con.unwrap(),
+                }],
             },
             Constructor::UnsignedInteger { .. } => todo!("unsigned integers"),
         }
@@ -118,12 +121,12 @@ impl<'t, C: Constructors> Merger<'t, C, ConstantBranch<C>> {
         let (is_reachable, to_push) = wc.with_branch(
             self.branches
                 .iter_mut()
-                .find(|(eparams, _)| *eparams == params)
-                .map(|(_, con)| con),
+                .find(|Branch { data: eparams, .. }| *eparams == params)
+                .map(|Branch { con, .. }| con),
             self.src,
         );
         if let Some(con) = to_push {
-            self.branches.push((params, con));
+            self.branches.push(Branch { data: params, con });
         }
         is_reachable
     }
@@ -133,7 +136,7 @@ impl<'t, C: Constructors> Merger<'t, C, ConstantBranch<C>> {
         existing: &mut WildcardKeeper<C>,
         wc: C::Wildcard,
     ) -> IsReachable {
-        for (params, econ) in self.branches.iter_mut() {
+        for Branch { data: params, con: econ } in self.branches.iter_mut() {
             econ.on_continuation(*params, &mut |con| {
                 self.src.clone().merge_with(con);
             });
@@ -144,10 +147,17 @@ impl<'t, C: Constructors> Merger<'t, C, ConstantBranch<C>> {
 
 impl<'t, C: Constructors> Merger<'t, C, VariantBranch<C>> {
     fn with_variant(mut self, _: &C::SumType, tag: u64) -> IsReachable {
-        match self.branches.iter_mut().find(|(etag, _)| *etag == tag) {
-            Some((_, econ)) => self.src.merge_with(econ),
+        match self
+            .branches
+            .iter_mut()
+            .find(|Branch { data: etag, .. }| *etag == tag)
+        {
+            Some(Branch { con: econ, .. }) => self.src.merge_with(econ),
             None => {
-                self.branches.push((tag, self.src.drain_to_patterntree()));
+                self.branches.push(Branch {
+                    data: tag,
+                    con: self.src.drain_to_patterntree(),
+                });
                 IsReachable(true)
             }
         }
@@ -159,13 +169,17 @@ impl<'t, C: Constructors> Merger<'t, C, VariantBranch<C>> {
         for tag in 0..=constr.max() {
             let params = constr.params_for(tag);
 
-            match self.branches.iter_mut().find(|(etag, _)| *etag == tag) {
+            match self
+                .branches
+                .iter_mut()
+                .find(|Branch { data: etag, .. }| *etag == tag)
+            {
                 None => {
                     let con = self.src.clone_to_padded(params).drain_to_patterntree();
-                    self.branches.push((tag, con));
+                    self.branches.push(Branch { data: tag, con });
                     is_reachable = IsReachable(true);
                 }
-                Some((_, econ)) => {
+                Some(Branch { con: econ, .. }) => {
                     is_reachable |= self.src.clone_to_padded(params).merge_with(econ);
                 }
             }
@@ -177,15 +191,9 @@ impl<'t, C: Constructors> Merger<'t, C, VariantBranch<C>> {
 
 impl<'t, C: Constructors> Merger<'t, C, InfiniteBranch<C>> {
     fn with_infinite(self, constr: C::Infinite, wc: &WildcardKeeper<C>) -> IsReachable {
-        let (is_reachable, to_push) = wc.with_branch(
-            self.branches
-                .iter_mut()
-                .find(|(econstr, _)| *econstr == constr)
-                .map(|(_, con)| con),
-            self.src,
-        );
+        let (is_reachable, to_push) = wc.with_branch(self.branches.get_matching(&constr), self.src);
         if let Some(con) = to_push {
-            self.branches.push((constr, con));
+            self.branches.push(Branch { data: constr, con });
         }
         is_reachable
     }
@@ -195,7 +203,7 @@ impl<'t, C: Constructors> Merger<'t, C, InfiniteBranch<C>> {
         existing: &mut WildcardKeeper<C>,
         wc: C::Wildcard,
     ) -> IsReachable {
-        for (_, econ) in self.branches.iter_mut() {
+        for Branch { con: econ, .. } in self.branches.iter_mut() {
             let params = 0; // TODO: we're gonna re-add support for this, there's no reason not to
             econ.on_continuation(params, &mut |con| {
                 self.src.clone().merge_with(con);
@@ -205,23 +213,29 @@ impl<'t, C: Constructors> Merger<'t, C, InfiniteBranch<C>> {
     }
 }
 
-fn min_max_from_bitsize(bitsize: u32) -> RangeInclusive<i128> {
-    let max = max_from_bitsize(bitsize);
-    (-max)..=max
+pub(crate) fn signed_min(bitsize: u32) -> i128 {
+    -signed_max(bitsize) - 1
 }
 
-fn max_from_bitsize(bitsize: u32) -> i128 {
+pub(crate) fn signed_max(bitsize: u32) -> i128 {
     2i128.pow(bitsize - 1) - 1
+}
+
+pub(crate) fn unsigned_max(bitsize: u32) -> u128 {
+    2u128.pow(bitsize) - 1
 }
 
 impl<'t, C: Constructors> Merger<'t, C, RangeBranch<C, i128>> {
     fn with_range(mut self, range: RangeInclusive<i128>) -> IsReachable {
         if self.ptr >= self.branches.len() {
-            self.branches.push((range, self.src.drain_to_patterntree()));
+            self.branches.push(Branch {
+                data: range,
+                con: self.src.drain_to_patterntree(),
+            });
             return IsReachable(true);
         }
 
-        let (erange, econ) = &mut self.branches[self.ptr];
+        let Branch { data: erange, con: econ } = &mut self.branches[self.ptr];
         let mut e_start = *erange.start();
         let e_end = *erange.end();
         let start = *range.start();
@@ -246,7 +260,10 @@ impl<'t, C: Constructors> Merger<'t, C, RangeBranch<C, i128>> {
                 *erange = start..=e_end;
                 e_start = start;
                 let econ = econ.clone();
-                self.branches.push((excluded_left_side, econ));
+                self.branches.push(Branch {
+                    data: excluded_left_side,
+                    con: econ,
+                });
             }
         } else {
             let extra_left_side = start..=e_start - 1;
@@ -256,10 +273,13 @@ impl<'t, C: Constructors> Merger<'t, C, RangeBranch<C, i128>> {
         if end_is_inside {
             if e_end != end {
                 let excluded_right_side = end + 1..=e_end;
-                let (erange, econ) = &mut self.branches[self.ptr];
+                let Branch { data: erange, con: econ } = &mut self.branches[self.ptr];
                 let econ = econ.clone();
                 *erange = e_start..=end;
-                self.branches.push((excluded_right_side, econ));
+                self.branches.push(Branch {
+                    data: excluded_right_side,
+                    con: econ,
+                });
             }
         } else {
             let extra_right_side = e_end + 1..=end;
@@ -267,15 +287,15 @@ impl<'t, C: Constructors> Merger<'t, C, RangeBranch<C, i128>> {
         }
 
         if start_is_inside || end_is_inside {
-            let (_, econ) = &mut self.branches[self.ptr];
+            let Branch { con: econ, .. } = &mut self.branches[self.ptr];
             is_reachable |= self.src.merge_with(econ);
         }
 
         is_reachable
     }
 
-    fn with_wildcard_integer(self, _: C::Wildcard, bitsize: u32) -> IsReachable {
-        self.with_range(min_max_from_bitsize(bitsize))
+    fn with_wildcard_signed_integer(self, _: C::Wildcard, bitsize: u32) -> IsReachable {
+        self.with_range(signed_min(bitsize)..=signed_max(bitsize))
     }
 
     fn additional(&mut self, range: RangeInclusive<i128>) -> IsReachable {
