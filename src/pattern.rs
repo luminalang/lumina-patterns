@@ -1,4 +1,6 @@
+use itertools::Itertools;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -6,9 +8,13 @@ use std::ops::RangeInclusive;
 
 /// The constructors that can be used as patterns defined by you
 ///
-///  * Constant
+///  * Lenghted
 ///      are compared by their parameter count
-///      (such as tuple or array)
+///      (such as slices)
+///
+///  * Constant
+///      always matches with itself and must always have the same
+///      amount of parameters
 ///
 ///  * Variant
 ///      sum type variants
@@ -21,7 +27,8 @@ use std::ops::RangeInclusive;
 /// assertion to verify that your type checker didn't leave any holes which depends on PartialEq for
 /// the other associated types as well.
 pub trait Constructors: Clone + std::fmt::Debug {
-    type Constant: Clone + Debug + PartialEq;
+    type Lengthed: Clone + Debug + PartialEq;
+    type Constant: Clone + Debug + PartialEq + ConstantConstructor;
     type SumType: Clone + Debug + PartialEq + SumtypeConstructor;
     type Infinite: Clone + Debug + PartialEq;
     type Wildcard: Clone + Debug + Default;
@@ -30,6 +37,10 @@ pub trait Constructors: Clone + std::fmt::Debug {
 pub trait SumtypeConstructor {
     fn max(&self) -> u64;
     fn params_for(&self, tag: u64) -> usize;
+}
+
+pub trait ConstantConstructor {
+    fn len_requirement(&self) -> usize;
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +56,26 @@ impl<C: Constructors> Pattern<C> {
 
     #[must_use]
     pub fn with_params(mut self, params: Vec<Self>) -> Self {
-        debug_assert!(self.params.is_empty());
+        #[cfg(debug_assertions)]
+        {
+            assert!(self.params.is_empty());
+            match &self.constr {
+                Constructor::Constant(constr) => {
+                    assert_eq!(
+                        params.len(),
+                        constr.len_requirement(),
+                        "constant takes the wrong amount of parameters"
+                    );
+                }
+                Constructor::Variant { type_, tag } => assert_eq!(
+                    params.len(),
+                    type_.params_for(*tag),
+                    "sum type takes the wrong amount of parameters"
+                ),
+                _ => {}
+            }
+        }
+
         self.params = params;
         self
     }
@@ -73,6 +103,7 @@ pub enum Constructor<C: Constructors> {
         tag: u64,
     },
     Infinite(C::Infinite),
+    Lenghted(C::Lengthed),
     Constant(C::Constant),
     Wildcard(C::Wildcard),
 }
@@ -117,5 +148,26 @@ impl<C: Constructors> Iterator for FlatPatterns<C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.buf.pop_front()
+    }
+}
+
+impl<S: fmt::Display, C: Constructors<SumType = S>> fmt::Display for Pattern<C> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.params[..] {
+            [] => fmt::Display::fmt(&self.constr, f),
+            params => write!(f, "{} {}", self.constr, params.iter().format(" ")),
+        }
+    }
+}
+
+impl<S: fmt::Display, C: Constructors<SumType = S>> fmt::Display for Constructor<C> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Constructor::Variant { type_, tag } => {
+                write!(f, "{}[{}]", type_, tag)
+            }
+            Constructor::Wildcard(wc) => write!(f, "{:?}", wc),
+            _ => todo!(),
+        }
     }
 }

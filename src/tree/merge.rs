@@ -1,5 +1,5 @@
 use super::*;
-use crate::pattern::SumtypeConstructor;
+use crate::pattern::{ConstantConstructor, SumtypeConstructor};
 use std::ops::RangeInclusive;
 
 pub(super) struct Merge<'t, C: Constructors> {
@@ -20,7 +20,7 @@ impl<'t, C: Constructors> Merge<'t, C> {
                     self.src.into_merger(branches).with_variant(&type_, tag)
                 }
 
-                (Constructor::Constant(constr), PatternTree::Constant(_, wc, branches)) => self
+                (Constructor::Lenghted(constr), PatternTree::Lengthed(_, wc, branches)) => self
                     .src
                     .into_merger(branches)
                     .with_constant(constr, wc, params),
@@ -32,6 +32,11 @@ impl<'t, C: Constructors> Merge<'t, C> {
                     assert_eq!(params, 0);
                     assert_eq!(bs, *bitsize, "inconsistent bitsize of range patterns");
                     self.src.into_merger(branches).with_range(range)
+                }
+
+                (Constructor::Constant(constr), PatternTree::Constant(econstr, con)) => {
+                    assert_eq!(constr.len_requirement(), econstr.len_requirement());
+                    self.src.merge_with(con)
                 }
 
                 (Constructor::Infinite(constr), PatternTree::Infinite(wc, branches)) => {
@@ -51,21 +56,33 @@ impl<'t, C: Constructors> Merge<'t, C> {
                         .src
                         .into_merger(branches)
                         .with_wildcard_infinite(wildcard, wc),
-                    PatternTree::Constant(_, wildcard, branches) => self
+                    PatternTree::Lengthed(_, wildcard, branches) => self
                         .src
                         .into_merger(branches)
-                        .with_wildcard_constant(wildcard, wc),
+                        .with_wildcard_lengthed(wildcard, wc),
+                    PatternTree::UnknownWildcard(existing) => existing.with_wildcard(wc, self.src),
+                    PatternTree::Constant(constr, con) => {
+                        let fillers =
+                            std::iter::repeat((Constructor::Wildcard(C::Wildcard::default()), 0))
+                                .take(constr.len_requirement());
+
+                        for filler in fillers {
+                            self.src.push_front(filler);
+                        }
+
+                        self.src.merge_with(con)
+                    }
                     _ => todo!(),
                 },
 
                 (constr, r @ PatternTree::UnknownWildcard(_)) => {
-                    self.src.push_front((constr.clone(), params));
                     take_mut::take(r, |dst| match dst {
                         PatternTree::UnknownWildcard(keeper) => {
-                            Self::init_from_wc(constr, &self.src, keeper)
+                            Self::init_from_wc(constr.clone(), &self.src, keeper)
                         }
                         _ => unreachable!(),
                     });
+                    self.src.push_front((constr.clone(), params));
                     self.src.merge_with(r)
                 }
 
@@ -84,7 +101,17 @@ impl<'t, C: Constructors> Merge<'t, C> {
                 keeper.buf.push((wc, src.clone()));
                 PatternTree::UnknownWildcard(keeper)
             }
-            Constructor::Constant(constr) => PatternTree::Constant(constr, keeper, vec![]),
+            Constructor::Lenghted(constr) => PatternTree::Lengthed(constr, keeper, vec![]),
+            Constructor::Constant(constr) => {
+                let params =
+                    std::iter::repeat(Pattern::new(Constructor::Wildcard(C::Wildcard::default())))
+                        .take(constr.len_requirement())
+                        .collect();
+                Pattern::new(Constructor::Constant(constr))
+                    .with_params(params)
+                    .flatten()
+                    .drain_to_patterntree()
+            }
             Constructor::Infinite(_) => PatternTree::Infinite(keeper, vec![]),
             Constructor::Variant { type_, .. } => PatternTree::Variant(type_, vec![]),
             Constructor::SignedInteger { bitsize, .. } => PatternTree::SignedInteger {
@@ -111,10 +138,10 @@ impl<C: Constructors> FlatPatterns<C> {
     }
 }
 
-impl<'t, C: Constructors> Merger<'t, C, ConstantBranch<C>> {
+impl<'t, C: Constructors> Merger<'t, C, LengthedBranch<C>> {
     fn with_constant(
         self,
-        _: C::Constant,
+        _: C::Lengthed,
         wc: &mut WildcardKeeper<C>,
         params: Params,
     ) -> IsReachable {
@@ -131,7 +158,7 @@ impl<'t, C: Constructors> Merger<'t, C, ConstantBranch<C>> {
         is_reachable
     }
 
-    fn with_wildcard_constant(
+    fn with_wildcard_lengthed(
         self,
         existing: &mut WildcardKeeper<C>,
         wc: C::Wildcard,
@@ -191,9 +218,10 @@ impl<'t, C: Constructors> Merger<'t, C, VariantBranch<C>> {
 
 impl<'t, C: Constructors> Merger<'t, C, InfiniteBranch<C>> {
     fn with_infinite(self, constr: C::Infinite, wc: &WildcardKeeper<C>) -> IsReachable {
-        let (is_reachable, to_push) = wc.with_branch(self.branches.get_matching(&constr), self.src);
+        let matching: Option<_> = self.branches.get_matching(&constr);
+        let (is_reachable, to_push) = wc.with_branch(matching, self.src);
         if let Some(con) = to_push {
-            self.branches.push(Branch { data: constr, con });
+            self.branches.push(Branch { data: constr.clone(), con });
         }
         is_reachable
     }
@@ -204,7 +232,14 @@ impl<'t, C: Constructors> Merger<'t, C, InfiniteBranch<C>> {
         wc: C::Wildcard,
     ) -> IsReachable {
         for Branch { con: econ, .. } in self.branches.iter_mut() {
-            let params = 0; // TODO: we're gonna re-add support for this, there's no reason not to
+            let params = 0;
+            // TODO: we're gonna re-add support for this, there's no reason not to
+            // TODO: this already *is* continuation. So; are we sure we want to call
+            // on_continuation?
+            //
+            // oh ye this code assumes there can be params but we give it params = 0
+            //
+            // and this isn't where the bug is because the bug is actually at Constant
             econ.on_continuation(params, &mut |con| {
                 self.src.clone().merge_with(con);
             });
@@ -286,16 +321,15 @@ impl<'t, C: Constructors> Merger<'t, C, RangeBranch<C, i128>> {
             is_reachable |= self.additional(extra_right_side);
         }
 
-        if start_is_inside || end_is_inside {
-            let Branch { con: econ, .. } = &mut self.branches[self.ptr];
-            is_reachable |= self.src.merge_with(econ);
-        }
+        let Branch { con: econ, .. } = &mut self.branches[self.ptr];
+        is_reachable |= self.src.merge_with(econ);
 
         is_reachable
     }
 
     fn with_wildcard_signed_integer(self, _: C::Wildcard, bitsize: u32) -> IsReachable {
-        self.with_range(signed_min(bitsize)..=signed_max(bitsize))
+        let full = signed_min(bitsize)..=signed_max(bitsize);
+        self.with_range(full)
     }
 
     fn additional(&mut self, range: RangeInclusive<i128>) -> IsReachable {

@@ -1,10 +1,11 @@
-use super::{Constructor, Constructors, IsReachable, Pattern, PatternTree, SumtypeConstructor};
+use super::{
+    ConstantConstructor, Constructor, Constructors, IsReachable, Pattern, PatternTree,
+    SumtypeConstructor,
+};
 use std::ops::RangeInclusive;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Constant {
-    Tuple,
-}
+struct Tuple(usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Infinite {
@@ -14,11 +15,12 @@ enum Infinite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SumType(&'static str, usize);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MyConstructors;
 
 impl Constructors for MyConstructors {
-    type Constant = Constant;
+    type Constant = Tuple;
+    type Lengthed = ();
     type SumType = SumType;
     type Infinite = Infinite;
     type Wildcard = Wildcard;
@@ -47,6 +49,12 @@ impl SumtypeConstructor for SumType {
             ("option", 1) => 0, // none takes 0 params
             _ => panic!("type not found: {}", self.0),
         }
+    }
+}
+
+impl ConstantConstructor for Tuple {
+    fn len_requirement(&self) -> usize {
+        self.0
     }
 }
 
@@ -82,7 +90,7 @@ fn none() -> Pattern<MyConstructors> {
 }
 
 fn tuple<const N: usize>(params: [Pattern<MyConstructors>; N]) -> Pattern<MyConstructors> {
-    Pattern::new(Constructor::Constant(Constant::Tuple)).with_params(params.to_vec())
+    Pattern::new(Constructor::Constant(Tuple(params.len()))).with_params(params.to_vec())
 }
 
 fn string(text: &'static str) -> Pattern<MyConstructors> {
@@ -208,8 +216,10 @@ fn lots_of_ranges() {
 #[test]
 fn init_from_wc() {
     let mut tree = PatternTree::from_pattern(&wildcard("_"));
+    println!(" !! init tree:\n{}", &tree);
     assert_reach!(tree, tuple([int(0..=0), int(1..=1)]), IsReachable(false));
-    assert!(tree.generate_missing_patterns().is_empty());
+    let missing = tree.generate_missing_patterns();
+    assert!(missing.is_empty());
 }
 
 #[test]
@@ -220,4 +230,38 @@ fn min_max() {
         i64::MIN as i128..=i64::MAX as i128
     );
     assert_eq!(unsigned_max(32), u32::MAX as u128);
+}
+
+#[test]
+fn unknown_wildcard() {
+    let tree = PatternTree::from_pattern(&wildcard("_"));
+    let missing = tree.generate_missing_patterns();
+    if !missing.is_empty() {
+        panic!("{:?}", missing);
+    }
+}
+
+#[test]
+fn tuple_of_wildcards() {
+    let mut tree = PatternTree::from_pattern(&tuple([int(0..=0), int(1..=1)]));
+    assert_reach!(
+        tree,
+        tuple([wildcard("a"), wildcard("b")]),
+        IsReachable(true)
+    );
+    assert_reach!(tree, tuple([int(0..=0), int(1..=1)]), IsReachable(false));
+    assert!(tree.is_exhaustive());
+    let missing = tree.generate_missing_patterns();
+    if !missing.is_empty() {
+        panic!("{:?}", missing);
+    }
+}
+
+#[test]
+fn empty_wildcard() {
+    let tree = PatternTree::from_pattern(&tuple([]));
+    let missing = tree.generate_missing_patterns();
+    if !missing.is_empty() {
+        panic!("{:?}", missing);
+    }
 }

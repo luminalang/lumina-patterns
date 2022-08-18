@@ -1,6 +1,5 @@
-use super::{Branch, PatternTree, RangeBranch, VariantBranch, WildcardKeeper};
-use crate::{Constructor, Constructors, Pattern, SumtypeConstructor};
-use std::ops::RangeInclusive;
+use super::{Branch, PatternTree, RangeBranch, WildcardKeeper};
+use crate::{ConstantConstructor, Constructor, Constructors, Pattern, SumtypeConstructor};
 
 #[derive(Debug)]
 struct Progress<'a, C: Constructors> {
@@ -66,14 +65,18 @@ impl<C: Constructors> PatternTree<C> {
                     }
                 }
             }
-            PatternTree::Constant(constr, wc, branches) => {
+            PatternTree::Lengthed(constr, wc, branches) => {
                 if !prog.clone().include_wildcard(wc) {
                     prog.include_branches(
                         branches,
-                        |_| Constructor::Constant(constr.clone()),
+                        |_| Constructor::Lenghted(constr.clone()),
                         |params| *params,
                     );
                 }
+            }
+            PatternTree::Constant(constr, con) => {
+                let params = constr.len_requirement();
+                con.get_missing(prog.new_params(Constructor::Constant(constr.clone()), params))
             }
             PatternTree::Infinite(wc, branches) => {
                 if !prog.clone().include_wildcard(wc) {
@@ -86,6 +89,9 @@ impl<C: Constructors> PatternTree<C> {
             }
             PatternTree::None => {
                 assert!(matches!(prog.params, None));
+            }
+            PatternTree::UnknownWildcard(wc) => {
+                prog.include_wildcard(wc);
             }
             other => todo!("{:?}", other),
         }
